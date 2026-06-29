@@ -1,12 +1,3 @@
-"""
-Atividade 01 - Pipeline ShopBrasil (Airflow + FakeStore API + PostgreSQL)
-
-Topologia (requisito do enunciado):
-    [Buscar produtos] -> [Validar schema] -> [Calcular metricas] -> [Persistir]
-        linear                linear              fan-out               fan-in
-
-Schedule: todos os dias as 06:00 (America/Sao_Paulo), catchup=False.
-"""
 
 from __future__ import annotations
 
@@ -30,9 +21,6 @@ SNAPSHOT_TABLE = "shopbrasil_snapshot"
 HISTORICO_TABLE = "shopbrasil_historico"
 
 
-# ---------------------------------------------------------------------------
-# Callbacks de ciclo de vida (requisito obrigatorio: on_failure/on_retry/on_success)
-# ---------------------------------------------------------------------------
 def _log_event(label: str):
     def _cb(context):
         ti = context.get("ti")
@@ -53,9 +41,6 @@ CALLBACKS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Operador customizado (requisito opcional: BaseOperator para validar schema)
-# ---------------------------------------------------------------------------
 class ValidarProdutosOperator(BaseOperator):
     """Valida o schema minimo dos produtos vindos da API."""
 
@@ -81,9 +66,6 @@ class ValidarProdutosOperator(BaseOperator):
         return produtos
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _postgres() -> PostgresHook:
     return PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
 
@@ -121,9 +103,6 @@ def _agregar_por_categoria(produtos: list[dict]) -> list[dict]:
     } for b in agg.values()]
 
 
-# ---------------------------------------------------------------------------
-# DAG
-# ---------------------------------------------------------------------------
 @dag(
     dag_id="shopbrasil_pipeline",
     description="Pipeline diario de metricas de produtos por categoria (FakeStore -> Postgres).",
@@ -144,13 +123,8 @@ def _agregar_por_categoria(produtos: list[dict]) -> list[dict]:
 )
 def shopbrasil_pipeline():
 
-    # Operador customizado (requisito opcional): instanciado no escopo do DAG
-    # para evitar problema de acesso a tasks via atributo do TaskGroup.
     validar_op = ValidarProdutosOperator(task_id="ingestao.validar_produtos")
 
-    # ============================================================
-    # TaskGroup INGESTAO (topologia linear)
-    # ============================================================
     with TaskGroup(group_id="ingestao") as ingestao:
 
         @task(
@@ -164,7 +138,6 @@ def shopbrasil_pipeline():
                 r.raise_for_status()
                 produtos = r.json()
             except (requests.RequestException, ValueError) as exc:
-                # raise dispara retry com exponential backoff (default_args)
                 raise AirflowFailException(f"Falha ao consultar FakeStore API: {exc}") from exc
 
             if not isinstance(produtos, list) or not produtos:
@@ -174,17 +147,8 @@ def shopbrasil_pipeline():
             LOG.info("API retornou %d produtos.", len(produtos))
             return produtos
 
-        # Dependencia entre buscar_produtos (TaskFlow) e validar_op (BaseOperator).
-        # O operador custom NAO fica dentro do with TaskGroup — ele recebe
-        # task_id fully-qualified ("ingestao.validar_produtos") para aparecer
-        # visualmente dentro do group na UI.
         buscar_produtos() >> validar_op
 
-    # ============================================================
-    # TaskGroup ANALISE (fan-out por categoria + fan-in no persist)
-    # IMPORTANTE: todas as chamadas de tasks devem acontecer DENTRO do
-    # `with`, senao o Airflow cria tasks duplicadas SEM o prefixo do group.
-    # ============================================================
     with TaskGroup(group_id="analise") as analise:
 
         @task(task_id="agregar_por_categoria")
@@ -195,8 +159,6 @@ def shopbrasil_pipeline():
 
         @task(task_id="calcular_metricas_categoria", pool="ecommerce_pool")
         def calcular_metricas(linha_categoria: dict) -> dict:
-            # Fan-out: 1 chamada por categoria via .expand
-            # Job minimo: log + retorno (agregacao ja foi feita em serie).
             LOG.info(
                 "Categoria '%s' (%d produtos) precos min=%.2f max=%.2f med=%.2f",
                 linha_categoria["categoria"],
@@ -209,20 +171,15 @@ def shopbrasil_pipeline():
 
         @task(task_id="consolidar_metricas")
         def consolidar(metricas: list[dict]) -> list[dict]:
-            # Fan-in: recebe todas as linhas via XCom automatico
             LOG.info("Consolidadas %d categorias.", len(metricas))
             return metricas
 
         @task(task_id="persistir_postgres")
         def persistir(metricas: list[dict], produtos: list[dict], **context) -> dict:
             """Snapshot idempotente + historico append-only."""
-            # data_interval_end = janela logica da run (data em que os dados se referem).
-            # Usar isso em vez de pendulum.now() garante que backfills/catchup
-            # gravem com a data correta da janela (e nao a data de hoje).
             data_exec = context["data_interval_end"].in_timezone("America/Sao_Paulo").to_date_string()
             pg = _postgres()
 
-            # 1) Snapshot idempotente (UPSERT por PK categoria+data)
             pg.insert_rows(
                 table=SNAPSHOT_TABLE,
                 rows=[(
@@ -238,7 +195,6 @@ def shopbrasil_pipeline():
                 replace_index=["id_categoria", "data_execucao"],
             )
 
-            # 2) Historico append-only (evolucao de precos)
             pg.insert_rows(
                 table=HISTORICO_TABLE,
                 rows=[(
@@ -254,8 +210,6 @@ def shopbrasil_pipeline():
                      len(metricas), len(produtos))
             return {"categorias": len(metricas), "produtos": len(produtos)}
 
-        # Dependencias DENTRO do `with` para que o prefixo `analise.` seja aplicado.
-        # validar_op.output e o ponto de entrada vindo do TaskGroup ingestao.
         produtos_ok = validar_op.output
         agregado = agregar(produtos_ok)
         metricas = calcular_metricas.expand(linha_categoria=agregado)
