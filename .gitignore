@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs do Airflow (gerados em runtime)
+logs/
+
+# Airflow metadata local
+airflow.cfg
+unittests.cfg
+webserver_config.py
+
+# Venv
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
